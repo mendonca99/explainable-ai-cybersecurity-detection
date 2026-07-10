@@ -1,0 +1,312 @@
+# Codigo Malicious URLs.csv
+
+import os
+import pandas as pd
+import tldextract
+import math
+import re
+import shap
+import warnings
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import logging as hf_logging
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, recall_score
+
+# ===============================
+# 0. Configurações
+# ===============================
+hf_logging.set_verbosity_error()
+warnings.filterwarnings("ignore")
+os.environ["SHAP_DISABLE_TF"] = "1"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ===============================
+# 1. Carregar dataset
+# ===============================
+df = pd.read_csv("malicious_urls.csv")[["url", "type"]]
+df["label"] = (df["type"] != "benign").astype(int)
+
+print("Dataset:", df.shape)
+
+# ===============================
+# 2. Funções de features da URL
+# ===============================
+
+
+def entropy(s):
+    from collections import Counter
+    counts = Counter(s)
+    probs = [c / len(s) for c in counts.values()]
+    return -sum(p * math.log2(p) for p in probs)
+
+
+def has_ip(url):
+    return int(bool(re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b", url)))
+
+
+def extract_url_features(url):
+    ext = tldextract.extract(url)
+    return {
+        "url_length": len(url),
+        "num_dots": url.count("."),
+        "num_hyphens": url.count("-"),
+        "entropy": entropy(url),
+        "has_ip": has_ip(url),
+        "subdomain_len": len(ext.subdomain),
+    }
+
+
+X_url = pd.DataFrame(df["url"].apply(extract_url_features).tolist())
+y = df["label"].values
+
+# ===============================
+# 3. Dataset e DataLoader PyTorch
+# ===============================
+
+
+class URLDatasetTabular(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X.values, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_url, y, test_size=0.33, stratify=y, random_state=42
+)
+
+train_dataset = URLDatasetTabular(X_train, y_train)
+test_dataset = URLDatasetTabular(X_test, y_test)
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+
+# ===============================
+# 4. Rede Neuronal Tabular
+# ===============================
+
+
+class URLNN(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+input_dim = X_train.shape[1]
+url_model = URLNN(input_dim).to(device)
+
+criterion = nn.BCELoss()
+optimizer = optim.Adam(url_model.parameters(), lr=1e-3)
+
+# ===============================
+# 5. Treinamento da rede neuronal
+# ===============================
+EPOCHS = 1000
+Epocas = []
+Losts = []
+
+for epoch in range(EPOCHS):
+    url_model.train()
+    total_loss = 0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device).unsqueeze(1)
+        optimizer.zero_grad()
+        outputs = url_model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward() 
+        optimizer.step()
+        total_loss += loss.item() * X_batch.size(0)
+    epoch_loss = total_loss / len(train_dataset)
+    Losts.append(epoch_loss)
+    Epocas.append(epoch + 1)    
+    print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(train_dataset):.4f}")
+
+
+# ===============================
+# 10. Plot Loss Curve
+# ===============================
+plt.figure(figsize=(10, 5)) # Define um tamanho para ficar visível
+plt.plot(Epocas, Losts, label='Training Loss', color='blue', marker='o') 
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Training Loss Curve')
+plt.legend()
+plt.grid(True) # Ajuda a visualizar os valores
+plt.show()
+
+
+
+# ===============================
+# 6. Avaliação URL model
+# ===============================
+url_model.eval()
+all_preds = []
+all_probs = []
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch = X_batch.to(device)
+        probs = url_model(X_batch).cpu().numpy()
+        all_probs.extend(probs.flatten())
+        all_preds.extend((probs >= 0.2).astype(int).flatten())
+
+print("\n=== URL Neural Network Model ===")
+print(classification_report(y_test, all_preds))
+print("AUC:", roc_auc_score(y_test, all_probs))
+print("Recall:", recall_score(y_test, all_preds))
+
+# ===============================
+# 7. NLP Model (DistilBERT)
+# ===============================
+MODEL_NAME = "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+nlp_model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME, num_labels=2).to(device)
+
+for p in nlp_model.distilbert.parameters():
+    p.requires_grad = False
+
+df_nlp = df.sample(n=10000, random_state=42)
+
+
+class URLDatasetNLP(Dataset):
+    def __init__(self, texts, labels):
+        self.enc = tokenizer(texts, truncation=True, padding=True, max_length=128, return_tensors="pt")
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        item = {k: v[idx] for k, v in self.enc.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+
+nlp_dataset = URLDatasetNLP(df_nlp["url"].tolist(), df_nlp["label"].tolist())
+nlp_loader = DataLoader(nlp_dataset, batch_size=16, shuffle=True)
+optimizer_nlp = optim.AdamW(nlp_model.classifier.parameters(), lr=2e-5)
+
+print("\n=== entrou 1=")
+
+nlp_model.train()
+for epoch in range(1000):  # treino rápido
+    total_loss = 0
+    for batch in nlp_loader:
+        optimizer_nlp.zero_grad()
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+        out = nlp_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        out.loss.backward()
+        optimizer_nlp.step()
+        total_loss += out.loss.item()
+        print(f"Epoch {epoch+1}/500 | Batch Loss: {out.loss.item():.4f}", end="\r")
+
+    print(f"NLP epoch done | loss={total_loss:.4f}")
+
+# ===============================
+# 8. SHAP (para NN tabular)
+# ===============================
+url_model.eval()
+explainer = shap.Explainer(lambda X: url_model(torch.tensor(X.values, dtype=torch.float32).to(device)).cpu().detach().numpy().flatten(), X_train)
+
+FEATURE_TEXT = {
+    "entropy": "URL com alta aleatoriedade",
+    "url_length": "URL excessivamente longa",
+    "subdomain_len": "subdomínio incomum",
+    "has_ip": "uso de IP no domínio",
+    "num_dots": "excesso de pontos",
+    "num_hyphens": "excesso de hífens", 
+}
+
+
+def explain_url(url, threshold=0.05):
+    feats = extract_url_features(url)
+    X = pd.DataFrame([feats])
+    shap_values = explainer(X).values[0]
+    impact = sorted(
+        zip(X.columns, shap_values), key=lambda x: abs(x[1]), reverse=True)
+    reasons = []
+    for name, val in impact:
+        if abs(val) >= threshold and name in FEATURE_TEXT:
+            if val > 0:
+                reasons.append(FEATURE_TEXT[name])
+            else:
+                reasons.append(f"baixa evidência de {FEATURE_TEXT[name]}")
+        if len(reasons) >= 3:
+            break
+    return reasons or ["padrões suspeitos gerais"]
+
+# ===============================
+# 9. Fusão URL + NLP
+# ===============================
+print("ENTROU 2 ")
+
+def final_risk(nlp_score, url_score):
+    return 0.63 * nlp_score + 0.37 * url_score
+
+
+# sample_url = df["url"].iloc[0]
+print("\n=== ANALISANDO URLs ===")
+
+results = []
+
+for url in df["url"].head(20):  # pode remover o head depois
+    url_features = pd.DataFrame([extract_url_features(url)])
+    url_tensor = torch.tensor(
+        url_features.values,
+        dtype=torch.float32
+    ).to(device)
+
+    url_score = url_model(url_tensor).item()
+
+    with torch.no_grad():
+        tok = tokenizer(
+            url,
+            return_tensors="pt",
+            truncation=True,
+            max_length=128
+        ).to(device)
+        logits = nlp_model(**tok).logits
+        nlp_score = torch.softmax(logits, dim=1)[0, 1].item()
+
+    risk = final_risk(nlp_score, url_score)
+
+    if risk >= 0.70:
+        action = "BLOCK"
+    elif risk >= 0.40:
+        action = "WARN"
+    else:
+        action = "ALLOW"
+
+    results.append((url, risk, action))
+    
+print("results : ", len(results))    
+for r in results:
+    print(r)
+
+
+
+# ===============================
+
+print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {epoch_loss:.4f}")
+
