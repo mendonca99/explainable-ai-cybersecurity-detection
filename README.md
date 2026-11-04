@@ -1,6 +1,6 @@
 # Malware Detection and Malicious URL Classification with Deep Learning and XAI
 
-Code repository developed as part of a Master's dissertation in Informatics (MINF) at Universidade da Maia (UMAIA), supervised by Professors Sérgio Silva and Luís Seco.
+Code repository developed as part of a Master's dissertation in Informatics (MINF) at Universidade da Maia (UMAIA), supervised by Professors Sérgio Silva.
 
 This project explores the application of Deep Learning and Explainable AI (XAI) techniques to two cybersecurity problems:
 
